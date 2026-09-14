@@ -1,0 +1,196 @@
+name: Build RBL TEST2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-test2:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Vérifier le ZIP source
+        run: |
+          test -f Redacted_BannerLab_Source.zip || {
+            echo "ERREUR: Redacted_BannerLab_Source.zip introuvable à la racine du dépôt."
+            exit 1
+          }
+          unzip -t Redacted_BannerLab_Source.zip
+
+      - name: Extraire les sources
+        run: |
+          rm -rf app app.extract
+          mkdir -p app.extract
+          unzip -q Redacted_BannerLab_Source.zip -d app.extract
+
+          if [ -f app.extract/package.json ]; then
+            mv app.extract app
+          else
+            mapfile -t PKGS < <(find app.extract -mindepth 2 -maxdepth 3 -type f -name package.json -print)
+            [ "${#PKGS[@]}" -eq 1 ] || { echo "ERREUR: package.json absent ou ambigu."; exit 1; }
+            ROOT="$(dirname "${PKGS[0]}")"
+            mkdir app
+            cp -a "$ROOT"/. app/
+            rm -rf app.extract
+          fi
+
+          test -f app/package.json
+
+      - name: Installer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Installer Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Préparer Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Installer les dépendances
+        working-directory: app
+        run: npm install --no-audit --no-fund
+
+      - name: Compiler le web
+        working-directory: app
+        run: npm run build
+
+      - name: Générer Android
+        working-directory: app
+        run: |
+          rm -rf android
+          npx cap add android
+          npx cap sync android
+
+      - name: Copier les ressources Android
+        working-directory: app
+        run: |
+          test -d android-res || { echo "ERREUR: android-res absent."; exit 1; }
+          cp -a android-res/. android/app/src/main/res/
+
+      - name: Appliquer le patch RBL
+        working-directory: app
+        env:
+          RBL_GITHUB_REPOSITORY: ${{ github.repository }}
+          RBL_TEST_BUILD: "1"
+        run: |
+          python3 android-patch/patch_manifest.py
+
+      - name: Transformer en application TEST2 indépendante
+        working-directory: app
+        run: |
+          python3 - <<'PY2'
+          from pathlib import Path
+          import re
+
+          gradle = Path('android/app/build.gradle')
+          txt = gradle.read_text(encoding='utf-8')
+          txt, n = re.subn(
+              r'(?m)^(\s*)applicationId\s+["\'][^"\']+["\']\s*$',
+              r'\1applicationId "com.bannerforge.mobile.test2"',
+              txt,
+              count=1
+          )
+          if n != 1:
+              raise SystemExit('Impossible de forcer applicationId TEST2')
+          gradle.write_text(txt, encoding='utf-8')
+
+          # Nom visible distinct pour pouvoir garder PROD/TEST/TEST2 côte à côte.
+          strings = Path('android/app/src/main/res/values/strings.xml')
+          if strings.exists():
+              s = strings.read_text(encoding='utf-8')
+              s = re.sub(r'<string name="app_name">.*?</string>',
+                         '<string name="app_name">Redacted BannerLab TEST2</string>', s, count=1)
+              s = re.sub(r'<string name="title_activity_main">.*?</string>',
+                         '<string name="title_activity_main">Redacted BannerLab TEST2</string>', s, count=1)
+              strings.write_text(s, encoding='utf-8')
+          PY2
+
+          grep -q 'applicationId "com.bannerforge.mobile.test2"' android/app/build.gradle || {
+            echo "ERREUR: package TEST2 absent."
+            exit 1
+          }
+
+      - name: Lire la version
+        working-directory: app
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "RBL_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Version: $VERSION"
+
+      - name: Créer la clé TEST2 locale du workflow
+        working-directory: app
+        run: |
+          mkdir -p signing
+          printf '%s' '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' | base64 --decode > signing/rbl-test2.jks
+          chmod 600 signing/rbl-test2.jks
+          keytool -list -keystore signing/rbl-test2.jks -storepass rbltest2 -alias rbltest2 >/dev/null
+          echo "Clé TEST2 OK (clé volontairement non secrète, réservée à TEST2)."
+
+      - name: Compiler RELEASE non signé
+        working-directory: app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew clean assembleRelease
+
+      - name: Aligner et signer TEST2
+        working-directory: app
+        run: |
+          UNSIGNED=$(find android/app/build/outputs/apk/release -type f -name '*unsigned*.apk' | head -n 1)
+          test -n "$UNSIGNED" || { echo "ERREUR: APK non signé introuvable."; exit 1; }
+
+          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          ZIPALIGN="$BUILD_TOOLS/zipalign"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+
+          mkdir -p output
+          ALIGNED="output/Redacted-BannerLab-TEST2-${RBL_VERSION}-aligned.apk"
+          SIGNED="output/Redacted-BannerLab-TEST2-v${RBL_VERSION}.apk"
+
+          "$ZIPALIGN" -f -p 4 "$UNSIGNED" "$ALIGNED"
+
+          "$APKSIGNER" sign \
+            --ks signing/rbl-test2.jks \
+            --ks-key-alias rbltest2 \
+            --ks-pass pass:rbltest2 \
+            --key-pass pass:rbltest2 \
+            --out "$SIGNED" \
+            "$ALIGNED"
+
+          "$APKSIGNER" verify --verbose --print-certs "$SIGNED"
+          rm -f "$ALIGNED"
+          echo "APK_PATH=$SIGNED" >> "$GITHUB_ENV"
+
+      - name: Vérifier le package final
+        working-directory: app
+        run: |
+          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          "$BUILD_TOOLS/aapt" dump badging "$APK_PATH" | head -n 8
+          "$BUILD_TOOLS/aapt" dump badging "$APK_PATH" | grep -q "package: name='com.bannerforge.mobile.test2'" || {
+            echo "ERREUR: l'APK final n'est pas TEST2."
+            exit 1
+          }
+
+      - name: Publier / remplacer la Release TEST2
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Une seule release roulante. Pas d'Actions artifact => pas de quota artifacts qui se remplit.
+          gh release delete test2-latest --cleanup-tag -y 2>/dev/null || true
+
+          gh release create test2-latest "$APK_PATH" \
+            --title "Redacted BannerLab TEST2 · $RBL_VERSION" \
+            --notes "Build TEST2 automatique · package com.bannerforge.mobile.test2 · run #${{ github.run_number }}" \
+            --prerelease
+
+          echo "Release TEST2 publiée."
+          
